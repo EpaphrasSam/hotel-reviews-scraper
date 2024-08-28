@@ -1,7 +1,9 @@
-import * as puppeteer from "puppeteer";
-import * as fs from "fs";
-import * as path from "path";
+import puppeteer from "puppeteer-extra";
+import { Page } from "puppeteer";
+import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { saveToCSV } from "../utils/csvWriter";
+
+puppeteer.use(StealthPlugin());
 
 const AIRBNB_URL =
   "https://www.airbnb.com/s/Kumasi--Ashanti-Region--Ghana/homes";
@@ -34,64 +36,97 @@ type Review = {
   reviewer: string;
 };
 
+const userAgents = [
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15",
+];
+
 export const scrapeAirbnbService = async (): Promise<ListingDetails[]> => {
-  const browser = await puppeteer.launch({ headless: "new" as any });
-  // const browser = await puppeteer.launch({ headless: false });
+  const browser = await puppeteer.launch({
+    headless: Math.random() > 0.5 ? ("new" as any) : false,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+  });
   const page = await browser.newPage();
   const listingDetails: ListingDetails[] = [];
+  const allListings: Listing[] = []; // Declare allListings here
 
   try {
-    await page.goto(AIRBNB_URL, { waitUntil: "networkidle2" });
-    await randomDelay();
+    const randomUserAgent =
+      userAgents[Math.floor(Math.random() * userAgents.length)];
+    await page.setUserAgent(randomUserAgent);
 
-    console.log("Navigating to Airbnb URL:", AIRBNB_URL);
+    await page.setExtraHTTPHeaders({
+      "Accept-Language": "en-US,en;q=0.9",
+      Referer: "https://www.airbnb.com",
+    });
 
-    const listings = await scrapeListings(page);
-    console.log("Number of hotels found:", listings.length);
+    let currentPage = 1;
+    let currentUrl = AIRBNB_URL;
 
-    for (const listing of listings) {
+    while (true) {
+      await page.goto(currentUrl, { waitUntil: "networkidle2" });
+      await randomDelay();
+
+      console.log(
+        `Navigating to Airbnb URL (Page ${currentPage}):`,
+        currentUrl
+      );
+
+      const pageListings = await scrapeListings(page);
+      allListings.push(...pageListings);
+      console.log(
+        `Number of hotels found on page ${currentPage}:`,
+        pageListings.length
+      );
+
+      // Try to find the next button, but don't throw an error if it's not found
+      const nextButton = await page.$('a[aria-label="Next"]');
+
+      if (!nextButton) {
+        console.log("No more pages to scrape. Reached the last page.");
+        break;
+      }
+
+      const nextPageUrl = await nextButton.evaluate((el) => el.href);
+
+      if (!nextPageUrl) {
+        console.log("Unable to find next page URL. Stopping pagination.");
+        break;
+      }
+
+      currentUrl = nextPageUrl;
+      currentPage++;
+      await randomDelay(); // Add random delay before navigating to the next page
+    }
+
+    console.log(`Total number of listings found: ${allListings.length}`);
+
+    // Now scrape details for each listing
+    for (let i = 0; i < allListings.length; i++) {
+      const listing = allListings[i];
       if (listing.name && listing.title) {
-        console.log("Scraping hotel:", listing.name);
-        const details = await scrapeListingDetails(page, listing as Listing);
-        listingDetails.push(details);
-        await randomDelay();
+        console.log(
+          `Scraping hotel ${i + 1}/${allListings.length}: ${listing.name}`
+        );
+        try {
+          const details = await scrapeListingDetails(page, listing);
+          listingDetails.push(details);
+          await randomDelay();
+        } catch (error) {
+          console.error(
+            `Error scraping hotel ${i + 1}: ${listing.name}`,
+            error
+          );
+          // Save progress before moving to the next listing
+          await saveProgress(listingDetails, i + 1, allListings.length);
+        }
       }
     }
 
     // Prepare data for CSV
-    const csvData = listingDetails.flatMap((listing) => {
-      const baseRow = {
-        Hotel: listing.hotel,
-        "Overall Rating": listing.overallRating,
-        Cleanliness: listing.cleanliness,
-        Accuracy: listing.accuracy,
-        Communication: listing.communication,
-        Location: listing.location,
-        "Check-in": listing.checkin,
-        Value: listing.value,
-      };
-
-      return listing.reviews.map((review, index) => ({
-        ...baseRow,
-        "Review Rating": review.rating,
-        "Review Date": review.date,
-        "Stay Duration": review.stayDuration,
-        "Review Content": review.content,
-        Reviewer: review.reviewer,
-        ...(index > 0
-          ? {
-              Hotel: "",
-              "Overall Rating": "",
-              Cleanliness: "",
-              Accuracy: "",
-              Communication: "",
-              Location: "",
-              "Check-in": "",
-              Value: "",
-            }
-          : {}),
-      }));
-    });
+    const csvData = prepareCsvData(listingDetails);
 
     // Define headers
     const headers = [
@@ -118,21 +153,94 @@ export const scrapeAirbnbService = async (): Promise<ListingDetails[]> => {
     return listingDetails;
   } catch (error) {
     console.error("Error in scrapeAirbnbService:", error);
+    // Save progress before throwing the error
+    await saveProgress(
+      listingDetails,
+      listingDetails.length,
+      allListings.length
+    );
     throw error;
   } finally {
     await browser.close();
   }
 };
 
+// New function to save progress
+async function saveProgress(
+  listingDetails: ListingDetails[],
+  current: number,
+  total: number
+) {
+  const csvData = prepareCsvData(listingDetails);
+  const headers = [
+    "Hotel",
+    "Overall Rating",
+    "Cleanliness",
+    "Accuracy",
+    "Communication",
+    "Location",
+    "Check-in",
+    "Value",
+    "Review Rating",
+    "Review Date",
+    "Stay Duration",
+    "Review Content",
+    "Reviewer",
+  ];
+  const filename = `airbnb_listings_progress_${current}_of_${
+    total || "unknown"
+  }.csv`;
+  await saveToCSV(csvData, headers, filename);
+  console.log(
+    `Progress saved: ${current}/${total || "unknown"} listings scraped.`
+  );
+}
+
+// Function to prepare CSV data (moved out of the main function for reusability)
+function prepareCsvData(listingDetails: ListingDetails[]) {
+  return listingDetails.flatMap((listing) => {
+    const baseRow = {
+      Hotel: listing.hotel,
+      "Overall Rating": listing.overallRating,
+      Cleanliness: listing.cleanliness,
+      Accuracy: listing.accuracy,
+      Communication: listing.communication,
+      Location: listing.location,
+      "Check-in": listing.checkin,
+      Value: listing.value,
+    };
+
+    return listing.reviews.map((review, index) => ({
+      ...baseRow,
+      "Review Rating": review.rating,
+      "Review Date": review.date,
+      "Stay Duration": review.stayDuration,
+      "Review Content": review.content,
+      Reviewer: review.reviewer,
+      ...(index > 0
+        ? {
+            Hotel: "",
+            "Overall Rating": "",
+            Cleanliness: "",
+            Accuracy: "",
+            Communication: "",
+            Location: "",
+            "Check-in": "",
+            Value: "",
+          }
+        : {}),
+    }));
+  });
+}
+
 async function scrapeListingDetails(
-  page: puppeteer.Page,
+  page: Page,
   listing: Listing
 ): Promise<ListingDetails> {
-  // Navigate to the listing page
   await page.goto(listing.url, { waitUntil: "networkidle0" });
+  await handleCaptcha(page);
 
   // Extract overall ratings
-
   const overallRatings = await page.evaluate(() => {
     const ratingCategories = Array.from(document.querySelectorAll(".l925rvg"));
     const ratings: { [key: string]: string } = {};
@@ -171,16 +279,11 @@ async function scrapeListingDetails(
   };
 }
 
-async function scrapeReviews(
-  page: puppeteer.Page,
-  listing: Listing
-): Promise<Review[]> {
-  // Construct the reviews URL
+async function scrapeReviews(page: Page, listing: Listing): Promise<Review[]> {
   const reviewsUrl = new URL(listing.url);
   reviewsUrl.pathname += "/reviews";
-
-  // Navigate to the reviews page
   await page.goto(reviewsUrl.toString(), { waitUntil: "networkidle0" });
+  await handleCaptcha(page);
 
   try {
     // Wait for the reviews to load with a shorter timeout
@@ -237,7 +340,7 @@ async function scrapeReviews(
   }
 }
 
-async function scrapeListings(page: puppeteer.Page) {
+async function scrapeListings(page: Page): Promise<Listing[]> {
   const listings = await page.evaluate(() => {
     const items = Array.from(
       document.querySelectorAll(
@@ -254,12 +357,10 @@ async function scrapeListings(page: puppeteer.Page) {
         .closest(".cy5jw6o")
         ?.querySelector(".r4a59j5 span[aria-hidden='true']");
       return {
-        name: nameElement ? nameElement.textContent?.trim() : "Unknown",
-        title: titleElement ? titleElement.textContent?.trim() : "Unknown",
+        name: nameElement?.textContent?.trim() ?? "Unknown",
+        title: titleElement?.textContent?.trim() ?? "Unknown",
         url: (item as HTMLAnchorElement).href,
-        rating: ratingElement
-          ? ratingElement.textContent?.split(" ")[0]
-          : "N/A",
+        rating: ratingElement?.textContent?.split(" ")[0] ?? "N/A",
       };
     });
   });
@@ -267,6 +368,19 @@ async function scrapeListings(page: puppeteer.Page) {
 }
 
 function randomDelay(): Promise<void> {
-  const delay = Math.floor(Math.random() * (5000 - 2000 + 1) + 2000); // Random delay between 2-5 seconds
+  const delay = Math.floor(Math.random() * (8000 - 3000 + 1) + 3000); // Random delay between 3-8 seconds
   return new Promise((resolve) => setTimeout(resolve, delay));
+}
+
+async function handleCaptcha(page: Page): Promise<boolean> {
+  const captchaSelector = 'div[class*="captcha"]'; // Adjust this selector based on Airbnb's CAPTCHA implementation
+  const isCaptchaPresent = (await page.$(captchaSelector)) !== null;
+
+  if (isCaptchaPresent) {
+    console.log("CAPTCHA detected. Waiting for manual solving...");
+    await page.waitForNavigation({ timeout: 120000 }); // Wait for 2 minutes or until navigation
+    return true;
+  }
+
+  return false;
 }
